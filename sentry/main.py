@@ -23,6 +23,7 @@ Functions:
     _run_spider: Dispatch a spider-mode scan (skeleton — logic added in later phase).
 """
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,8 +39,18 @@ console = Console()
 # lifetime of the process; repeated invocations see the same option set.
 _PASSIVE_AVAILABLE: bool = is_passive_available()
 
-_HELP_TEXT = """\
-Sentry -- API Security Header Scanner.
+def _build_help_text() -> str:
+    """
+    Build the CLI help text for the current environment.
+
+    Appends a passive mode example only when a graphical display was detected,
+    matching the conditional registration of the --passive flag itself.
+
+    Returns:
+        str: Formatted help text string passed to the Click command.
+    """
+    base = """\
+sentryscan -- API Security Header Scanner.
 
 Scans HTTP APIs for missing or misconfigured security headers and produces a
 structured report. Choose a scan mode, supply a target URL or URL list, and
@@ -47,14 +58,15 @@ optionally control output format and report save location.
 
 Examples:
 
-  sentry --active --url https://api.example.com
+  sentryscan --active --url https://api.example.com
 
-  sentry --spider --url https://example.com --depth 5
+  sentryscan --active --file urls.txt --output json
 
-  sentry --active --file urls.txt --output json
-
-  sentry --active --url https://api.example.com --save /tmp/my-reports
+  sentryscan --active --url https://api.example.com --save /tmp/my-reports
 """
+    if _PASSIVE_AVAILABLE:
+        base += "\n  sentryscan --passive --url https://app.example.com --timeout 120\n"
+    return base
 
 
 def _build_params() -> list[click.Parameter]:
@@ -97,7 +109,7 @@ def _build_params() -> list[click.Parameter]:
                 ["--spider"],
                 is_flag=True,
                 default=False,
-                help="Auto-discover and scan endpoints from a base URL.",
+                help="[NOT YET IMPLEMENTED] Auto-discover and scan endpoints from a base URL.",
             ),
         ]
     )
@@ -129,7 +141,10 @@ def _build_params() -> list[click.Parameter]:
                 type=click.Choice(["table", "json", "html", "pdf"], case_sensitive=False),
                 default="table",
                 show_default=True,
-                help="Terminal output format. Does not affect the saved report.",
+                help=(
+                    "Output format. table/json control terminal display. "
+                    "html/pdf save an additional report file alongside report.json."
+                ),
             ),
             click.Option(
                 ["--save", "-s"],
@@ -150,7 +165,14 @@ def _build_params() -> list[click.Parameter]:
                 default=30,
                 show_default=True,
                 metavar="SECONDS",
-                help="Per-request timeout in seconds.",
+                help=(
+                    "Per-request timeout in seconds."
+                    + (
+                        " For --passive, this is the total browser session duration"
+                        " — use a higher value (e.g. 120) to give yourself time to browse."
+                        if _PASSIVE_AVAILABLE else ""
+                    )
+                ),
             ),
             click.Option(
                 ["--depth", "-d"],
@@ -171,6 +193,15 @@ def _build_params() -> list[click.Parameter]:
                 is_flag=True,
                 default=False,
                 help="Print each request as it is made.",
+            ),
+            click.Option(
+                ["--user-agent"],
+                default=None,
+                metavar="STRING",
+                help=(
+                    "Override the HTTP User-Agent header sent with each request. "
+                    "Default is a neutral string that does not advertise this tool."
+                ),
             ),
         ]
     )
@@ -223,6 +254,7 @@ def _run(
     depth: int,
     insecure: bool,
     verbose: bool,
+    user_agent: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """
@@ -248,8 +280,10 @@ def _run(
         **kwargs: Absorbs 'passive' (bool) when registered in this environment.
 
     Raises:
-        click.UsageError: When more than one mode flag is given, when no target
-                          is provided, or when both --url and --file are given.
+        click.UsageError: When more than one mode flag is given; when no target
+                          is provided; when both --url and --file are given;
+                          when --passive is combined with --file; or when the
+                          --save directory is not writable.
     """
     # **kwargs carries 'passive' only when _PASSIVE_AVAILABLE is True
     passive: bool = kwargs.get("passive", False)
@@ -276,9 +310,47 @@ def _run(
 
     # Require exactly one target source
     if url is None and file is None:
+        if mode == "passive":
+            raise click.UsageError(
+                "--passive requires a target URL.\n"
+                "Usage: sentryscan --passive --url https://app.example.com --timeout 120"
+            )
         raise click.UsageError("Provide a target with --url URL or --file FILE.")
     if url is not None and file is not None:
         raise click.UsageError("Use --url or --file, not both.")
+
+    # Bug 1: passive mode only supports a single URL — file input would crash
+    # inside passive.run() because config["url"] would be None.
+    if mode == "passive" and file is not None:
+        raise click.UsageError(
+            "--passive requires --url; batch file input is not supported in passive mode."
+        )
+
+    # Bug 5: --depth only has meaning for --spider; warn so the user is not
+    # misled into thinking it affects active or passive scan behaviour.
+    if depth != 3 and mode != "spider":
+        console.print(
+            "[yellow][[WARN]][/yellow] --depth is only used with --spider "
+            f"and has no effect in {mode} mode."
+        )
+
+    # Bug 6: validate the --save directory before the scan starts so a
+    # permissions error does not silently discard results after a long session.
+    if save is not None:
+        try:
+            check_dir = save if save.exists() else save.parent
+            writable = os.access(check_dir, os.W_OK)
+        except PermissionError:
+            writable = False
+        if not writable:
+            raise click.UsageError(
+                f"Cannot write to save directory: {save}\n"
+                "Check that the path exists and you have write permission."
+            )
+        try:
+            save.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise click.UsageError(f"Cannot create save directory {save}: {exc}") from exc
 
     scan_config: dict = {
         "url": url,
@@ -289,6 +361,7 @@ def _run(
         "depth": depth,
         "verify_ssl": not insecure,
         "verbose": verbose,
+        "user_agent": user_agent,
     }
 
     if mode == "passive":
@@ -318,17 +391,17 @@ def _run_passive(config: dict) -> None:
     """
     Dispatch a passive-mode scan via browser interception and print results.
 
-    Skeleton implementation — Playwright + mitmproxy logic is added in the
-    passive-mode phase. This function is only reachable when _PASSIVE_AVAILABLE
-    is True (i.e. --passive was registered and the user passed it), so no
-    additional display check is needed here.
+    Imports modes.passive lazily so that Playwright and mitmproxy are only
+    loaded when passive mode is actually invoked. This function is only
+    reachable when _PASSIVE_AVAILABLE is True, so no additional display check
+    is needed here.
 
     Args:
         config (dict): Scan configuration dict built by _run.
     """
-    from sentry.modes import passive as _passive_module  # noqa: F401
+    from sentry.modes.passive import run as _passive_run
 
-    console.print("[bold cyan][[INFO]][/bold cyan] Passive scan not yet implemented.")
+    _passive_run(config)
 
 
 def _run_spider(config: dict) -> None:
@@ -349,10 +422,10 @@ def _run_spider(config: dict) -> None:
 # Build the Click command at module import time. _build_params() reads the
 # environment cache so the params list is fixed before any invocation occurs.
 cli = click.Command(
-    name="sentry",
+    name="sentryscan",
     callback=_run,
     params=_build_params(),
-    help=_HELP_TEXT,
+    help=_build_help_text(),
     context_settings={
         "help_option_names": ["--help", "-h"],
         "max_content_width": 100,

@@ -34,6 +34,12 @@ class CapturedResponse:
         status_code (int): HTTP status code.
         headers (dict[str, str]): Response headers as a plain dict (lowercased keys).
         content_type (str): Convenience copy of the Content-Type header value.
+        request_headers (dict[str, str]): Request headers sent by the browser
+            (lowercased keys). Used for auth detection and CORS analysis in
+            passive mode. Empty dict when not captured.
+        body_sample (str): First 2 KB of the response body decoded as UTF-8.
+            Populated for error responses (4xx/5xx) and all API responses.
+            Empty string when not captured.
 
     Example:
         r = CapturedResponse(
@@ -41,6 +47,8 @@ class CapturedResponse:
             status_code=200,
             headers={"content-type": "application/json"},
             content_type="application/json",
+            request_headers={"authorization": "Bearer eyJ..."},
+            body_sample='{"id": 1}',
         )
     """
 
@@ -48,6 +56,8 @@ class CapturedResponse:
     status_code: int
     headers: dict[str, str] = field(default_factory=dict)
     content_type: str = ""
+    request_headers: dict[str, str] = field(default_factory=dict)
+    body_sample: str = ""
 
 
 class CaptureStore:

@@ -37,7 +37,7 @@ from rich.table import Table
 from sentry import __version__
 from sentry.config.headers import AUTH_SECURITY_FLAGS
 from sentry.core.analyzer import EndpointResult, analyze_headers
-from sentry.core.reporter import save_report
+from sentry.core.reporter import save_html_report, save_pdf_report, save_report
 
 console = Console()
 
@@ -90,12 +90,17 @@ class ActiveScanner:
         results = scanner.scan()
     """
 
+    # Default User-Agent: identifies the tool without advertising "security scanner",
+    # which can trigger WAF blocks and appear in target access logs.
+    _DEFAULT_UA = f"sentryscan/{__version__}"
+
     def __init__(
         self,
         urls: list[str],
         timeout: int = 30,
         verify_ssl: bool = True,
         verbose: bool = False,
+        user_agent: Optional[str] = None,
     ) -> None:
         """
         Initialise the scanner with a target list and request options.
@@ -105,11 +110,15 @@ class ActiveScanner:
             timeout (int): Per-request timeout in seconds.
             verify_ssl (bool): Verify TLS certificates when True.
             verbose (bool): Echo each request URL to the terminal when True.
+            user_agent (Optional[str]): Override the HTTP User-Agent header.
+                Defaults to a neutral string that does not advertise the tool
+                as a security scanner to avoid WAF triggers and log noise.
         """
         self.urls = urls
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self.verbose = verbose
+        self.user_agent = user_agent or self._DEFAULT_UA
         self.errors: dict[str, str] = {}
 
     def scan(self) -> list[EndpointResult]:
@@ -129,8 +138,15 @@ class ActiveScanner:
             Nothing — all request-level errors are captured in self.errors.
         """
         results: list[EndpointResult] = []
+
+        # The user explicitly opted in to skipping verification; suppress the
+        # urllib3 warning that would otherwise fire on every request.
+        if not self.verify_ssl:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         session = requests.Session()
-        session.headers["User-Agent"] = f"Sentry/{__version__} security-scanner"
+        session.headers["User-Agent"] = self.user_agent
 
         for url in self.urls:
             if self.verbose:
@@ -143,11 +159,42 @@ class ActiveScanner:
                     allow_redirects=True,
                 )
                 body_sample = response.text[:2048] if response.text else None
+
+                # Send an OPTIONS preflight with a probe origin to surface CORS
+                # misconfiguration. The probe origin is deliberately invalid so it
+                # can never be a legitimately whitelisted value; any reflection of
+                # it is therefore a blind-reflection bug.
+                merged_headers = dict(response.headers)
+                probe_request_headers: dict[str, str] = {}
+                _probe_origin = "https://sentry-probe.invalid"
+                try:
+                    options_resp = session.options(
+                        url,
+                        headers={
+                            "Origin": _probe_origin,
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "Authorization, Content-Type",
+                        },
+                        timeout=self.timeout,
+                        verify=self.verify_ssl,
+                        allow_redirects=False,
+                    )
+                    # Merge only CORS-relevant headers from the OPTIONS response
+                    # so they reach _analyze_cors() without overwriting other headers.
+                    for k, v in options_resp.headers.items():
+                        kl = k.lower()
+                        if kl.startswith("access-control") or kl == "vary":
+                            merged_headers[k] = v
+                    probe_request_headers = {"origin": _probe_origin}
+                except Exception:
+                    pass
+
                 result = analyze_headers(
                     url=url,
-                    response_headers=dict(response.headers),
+                    response_headers=merged_headers,
                     body_sample=body_sample,
                     status_code=response.status_code,
+                    request_headers=probe_request_headers or None,
                 )
                 results.append(result)
             except requests.exceptions.SSLError as exc:
@@ -346,6 +393,8 @@ def _render_results(
         results (list[EndpointResult]): Completed endpoint analyses.
         errors (dict[str, str]): URL -> error string for failed requests.
         output_format (str): One of 'table', 'json', 'html', 'pdf'.
+            html and pdf render as table to terminal; the file is saved by
+            the caller after _render_results returns.
         results_dict (Optional[dict]): Pre-built results dict; used for JSON
             output to avoid rebuilding. Built from results if not provided.
     """
@@ -353,12 +402,6 @@ def _render_results(
         data = results_dict or _build_results_dict(results, errors, "")
         target_console.print(json.dumps(data, indent=2, default=str))
         return
-
-    if output_format in ("html", "pdf"):
-        target_console.print(
-            f"[cyan][[INFO]][/cyan] {output_format.upper()} output not yet "
-            "implemented; rendering as table."
-        )
 
     target_console.print("\n[bold]Sentry -- Active Scan[/bold]")
 
@@ -427,6 +470,7 @@ def run(config: dict) -> None:
         timeout=timeout,
         verify_ssl=verify_ssl,
         verbose=verbose,
+        user_agent=config.get("user_agent"),
     )
     results = scanner.scan()
 
@@ -442,9 +486,14 @@ def run(config: dict) -> None:
     _render_results(text_console, results, scanner.errors, "table", results_dict)
     text_output = text_buf.getvalue()
 
-    save_report(
+    report_dir = save_report(
         target=scan_target,
         results=results_dict,
         text_output=text_output,
         save_root=save_root,
     )
+
+    if output == "html":
+        save_html_report(results_dict, report_dir)
+    elif output == "pdf":
+        save_pdf_report(results_dict, report_dir)

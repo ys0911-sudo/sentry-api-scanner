@@ -24,6 +24,8 @@ Functions:
 import json
 import os
 import platform
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -105,6 +107,65 @@ def detect_and_save() -> dict:
     result = detect_environment()
     save_environment(result)
     return result
+
+
+def setup() -> None:
+    """
+    Run all post-install setup in one call: cache environment detection and
+    install Chromium when a display is available.
+
+    Called by the 'sentry-setup' entry point. Safe to run on headless servers
+    (Chromium install is skipped when no display is detected). Intended as an
+    optional but recommended one-time step after pip install so that the first
+    'sentry --passive' run does not incur the Chromium download delay.
+
+    On systems where the .deb package is used, postinst handles all of this
+    automatically and 'sentry-setup' never needs to be run manually.
+    """
+    result = detect_and_save()
+    passive = result.get("passive_available", False)
+    if passive:
+        print("[INFO] Display detected — installing Chromium for passive mode...")
+        install_chromium_if_passive()
+    else:
+        print("[INFO] Headless environment — passive mode unavailable, Chromium skipped.")
+    print("[PASS] Sentry setup complete.")
+
+
+def install_chromium_if_passive() -> None:
+    """
+    Install the Playwright Chromium browser when passive mode is available.
+
+    Called by the 'sentry-install-browser' entry point after pip install on
+    desktop systems. On headless installations is_passive_available() returns
+    False and this function exits without downloading anything, so running
+    'sentry-install-browser' on a server is always safe and a no-op.
+
+    Uses sys.executable -m playwright rather than a bare 'playwright' command
+    because after pip install inside a venv the module is importable but the
+    playwright script may not yet be on PATH.
+
+    Raises:
+        SystemExit: If playwright install chromium exits with a non-zero code.
+    """
+    if not is_passive_available():
+        print("[INFO] Headless environment detected — Chromium install skipped.")
+        return
+
+    print("[INFO] Installing Chromium for passive mode...")
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=False,
+    )
+    if result.returncode != 0:
+        print(
+            "[FAIL] playwright install chromium failed. "
+            "Run it manually: python -m playwright install chromium",
+            file=sys.stderr,
+        )
+        sys.exit(result.returncode)
+
+    print("[PASS] Chromium installed. Passive mode is ready.")
 
 
 def is_passive_available() -> bool:

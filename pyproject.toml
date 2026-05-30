@@ -30,18 +30,20 @@ dependencies = [
     "rich>=13.7",
     "pyyaml>=6.0",
     "requests>=2.31",
+    "reportlab>=4.0",
+    "pillow>=10.0",
 ]
 
-[project.optional-dependencies]
-pdf = ["reportlab>=4.0", "pillow>=10.0"]
-
 [project.scripts]
-sentry = "sentry.main:cli"
-# Run 'sentry-detect-env' once after 'pip install' on systems where the
-# post-install hook does not run automatically (e.g. manual venv installs).
-# It writes ~/.sentry/environment.json so that the CLI knows whether
-# --passive is available without probing the display on every invocation.
+sentryscan = "sentry.main:cli"
+# Optional one-time setup: caches display environment and installs Chromium
+# when a display is detected. NOT required — sentry works immediately after
+# pip install. Run this to pre-warm everything so the first passive scan
+# does not incur the Chromium download delay.
+sentry-setup = "sentry.config.environment:setup"
+# Individual commands kept for .deb postinst and advanced use.
 sentry-detect-env = "sentry.config.environment:detect_and_save"
+sentry-install-browser = "sentry.config.environment:install_chromium_if_passive"
 
 [project.urls]
 Repository = "https://github.com/ys0911-sudo/sentry"
