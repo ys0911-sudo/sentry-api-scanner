@@ -24,7 +24,40 @@ Functions:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import asyncio
+import threading
+from typing import Any
+
+from sentry.core.storage import CapturedResponse, CaptureStore
+
+# Content-type prefixes that identify API responses worth capturing.
+_API_CONTENT_TYPES: tuple[str, ...] = (
+    "application/json",
+    "application/vnd.api+json",
+    "application/hal+json",
+    "application/graphql",
+    "application/xml",
+    "text/xml",
+    "application/soap+xml",
+    "application/grpc",
+    "application/grpc+proto",
+    "application/grpc+json",
+    "application/grpc-web",
+    "application/grpc-web+proto",
+    "application/json-rpc",
+    "application/atom+xml",
+)
+
+# Content-type prefixes for static assets that are silently discarded.
+_STATIC_PREFIXES: tuple[str, ...] = (
+    "image/",
+    "font/",
+    "text/css",
+    "application/javascript",
+    "text/javascript",
+    "audio/",
+    "video/",
+)
 
 
 class SentryAddon:
@@ -44,7 +77,7 @@ class SentryAddon:
         # Registered via mitmproxy's addons list
     """
 
-    def __init__(self, store: Any, target_host: str) -> None:
+    def __init__(self, store: CaptureStore, target_host: str) -> None:
         """
         Initialise the addon with a shared capture store and host filter.
 
@@ -65,8 +98,25 @@ class SentryAddon:
         Args:
             flow: mitmproxy HTTPFlow object containing request/response data.
         """
-        # Implementation added in the passive-mode phase
-        raise NotImplementedError("SentryAddon.response is not yet implemented.")
+        if flow.request.host != self.target_host:
+            return
+
+        content_type = flow.response.headers.get("content-type", "").lower()
+
+        for prefix in _STATIC_PREFIXES:
+            if content_type.startswith(prefix):
+                return
+
+        if not any(content_type.startswith(ct) for ct in _API_CONTENT_TYPES):
+            return
+
+        headers = {k.lower(): v for k, v in flow.response.headers.items()}
+        self.store.add(CapturedResponse(
+            url=flow.request.pretty_url,
+            status_code=flow.response.status_code,
+            headers=headers,
+            content_type=content_type,
+        ))
 
 
 def build_proxy_options(host: str = "127.0.0.1", port: int = 8080) -> Any:
@@ -83,8 +133,13 @@ def build_proxy_options(host: str = "127.0.0.1", port: int = 8080) -> Any:
     Returns:
         mitmproxy.options.Options: Configured options object ready for DumpMaster.
     """
-    # Implementation added in the passive-mode phase
-    raise NotImplementedError("build_proxy_options is not yet implemented.")
+    from mitmproxy.options import Options
+
+    return Options(
+        listen_host=host,
+        listen_port=port,
+        ssl_insecure=True,
+    )
 
 
 def run_proxy(
@@ -108,5 +163,23 @@ def run_proxy(
     Returns:
         mitmproxy DumpMaster instance running in a background thread.
     """
-    # Implementation added in the passive-mode phase
-    raise NotImplementedError("run_proxy is not yet implemented.")
+    from mitmproxy.tools.dump import DumpMaster
+
+    opts = build_proxy_options(host=host, port=port)
+
+    # mitmproxy 12.x calls asyncio.get_event_loop() during DumpMaster.__init__,
+    # which raises RuntimeError when called from a non-async context with no
+    # current loop. Create and register a loop before constructing the master.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+    master.addons.add(SentryAddon(store=store, target_host=target_host))
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(master.run())
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return master
