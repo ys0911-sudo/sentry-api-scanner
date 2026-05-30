@@ -334,6 +334,9 @@ def analyze_headers(
     # --- Pass 2: authentication detection --------------------------------
     auth_findings = _detect_auth(url, req_lower, resp_lower)
 
+    # --- Pass 3: CORS misconfiguration detection -------------------------
+    auth_findings.extend(_analyze_cors(resp_lower, req_lower))
+
     return EndpointResult(
         url=url,
         score=score,
@@ -574,6 +577,102 @@ def _check_cookies(resp_lower: dict[str, str]) -> list[AuthFinding]:
             auth_type="session",
             flags=flags,
             details=f"Session cookie '{name_part}' detected in Set-Cookie response header.",
+            token_info={},
+        ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# CORS misconfiguration detection
+# ---------------------------------------------------------------------------
+
+def _analyze_cors(
+    resp_lower: dict[str, str],
+    req_lower: dict[str, str],
+) -> list[AuthFinding]:
+    """
+    Detect CORS misconfiguration in response headers and return AuthFindings.
+
+    Checks Access-Control-Allow-Origin for wildcard and reflected-origin
+    patterns, flags dangerous combinations with Access-Control-Allow-Credentials,
+    and warns when Vary: Origin is absent from CORS responses.
+
+    In active mode, req_lower contains the probe Origin header sent by the
+    OPTIONS preflight. In passive mode, req_lower contains the real browser
+    request headers captured by mitmproxy.
+
+    Args:
+        resp_lower (dict[str, str]): Lowercased response headers.
+        req_lower (dict[str, str]): Lowercased request headers (may be empty).
+
+    Returns:
+        list[AuthFinding]: One entry per detected CORS issue. Empty list when
+                           no CORS headers are present or no issues are found.
+    """
+    acao = resp_lower.get("access-control-allow-origin", "").strip()
+    if not acao:
+        return []
+
+    findings: list[AuthFinding] = []
+    acac = resp_lower.get("access-control-allow-credentials", "").strip().lower()
+    vary = resp_lower.get("vary", "").lower()
+    credentials_true = acac == "true"
+
+    if acao == "*":
+        if credentials_true:
+            findings.append(AuthFinding(
+                auth_type="cors",
+                flags=["cors_wildcard_with_credentials"],
+                details=(
+                    "Access-Control-Allow-Origin: * with Allow-Credentials: true. "
+                    "Browsers reject this per spec, but the server config is broken."
+                ),
+                token_info={},
+            ))
+        else:
+            findings.append(AuthFinding(
+                auth_type="cors",
+                flags=["cors_wildcard_origin"],
+                details="Access-Control-Allow-Origin: * allows any origin to read this response.",
+                token_info={},
+            ))
+    else:
+        # Check for origin reflection: server echoes back whatever Origin was sent
+        sent_origin = req_lower.get("origin", "").strip()
+        if sent_origin and acao == sent_origin:
+            if credentials_true:
+                findings.append(AuthFinding(
+                    auth_type="cors",
+                    flags=["cors_reflected_origin_with_credentials"],
+                    details=(
+                        f"Server reflects Origin '{sent_origin}' with Allow-Credentials: true. "
+                        "Any website can make authenticated cross-origin requests to this endpoint."
+                    ),
+                    token_info={},
+                ))
+            else:
+                findings.append(AuthFinding(
+                    auth_type="cors",
+                    flags=["cors_reflected_origin"],
+                    details=(
+                        f"Server reflects the request Origin '{sent_origin}' verbatim. "
+                        "Verify this origin is validated against a whitelist, not echoed blindly."
+                    ),
+                    token_info={},
+                ))
+
+    # Vary: Origin must be present whenever CORS headers are set, otherwise a
+    # cache may serve a permissive CORS response to a non-CORS request or to a
+    # request from a different origin.
+    if "origin" not in vary:
+        findings.append(AuthFinding(
+            auth_type="cors",
+            flags=["cors_missing_vary_origin"],
+            details=(
+                "Access-Control-Allow-Origin is set but Vary: Origin is absent. "
+                "CDN or reverse-proxy caches may serve this response to other origins."
+            ),
             token_info={},
         ))
 

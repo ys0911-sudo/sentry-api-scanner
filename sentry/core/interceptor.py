@@ -94,6 +94,8 @@ class SentryAddon:
 
         Called by mitmproxy for every completed response. Checks the host filter
         and content type before forwarding headers to the capture store.
+        Request headers and a response body sample are also captured so that
+        auth detection and CORS analysis have full context in passive mode.
 
         Args:
             flow: mitmproxy HTTPFlow object containing request/response data.
@@ -107,15 +109,32 @@ class SentryAddon:
             if content_type.startswith(prefix):
                 return
 
-        if not any(content_type.startswith(ct) for ct in _API_CONTENT_TYPES):
+        is_api = any(content_type.startswith(ct) for ct in _API_CONTENT_TYPES)
+        is_error = flow.response.status_code >= 400
+
+        # Capture API responses and all error responses. Non-API success
+        # responses (HTML pages, etc.) are skipped as noise.
+        if not is_api and not is_error:
             return
 
         headers = {k.lower(): v for k, v in flow.response.headers.items()}
+        request_headers = {k.lower(): v for k, v in flow.request.headers.items()}
+
+        # Capture up to 2 KB of response body for error analysis and body-based
+        # API type detection. Decode with replace so binary payloads don't crash.
+        try:
+            raw = flow.response.get_content()
+            body_sample = raw[:2048].decode("utf-8", errors="replace") if raw else ""
+        except Exception:
+            body_sample = ""
+
         self.store.add(CapturedResponse(
             url=flow.request.pretty_url,
             status_code=flow.response.status_code,
             headers=headers,
             content_type=content_type,
+            request_headers=request_headers,
+            body_sample=body_sample,
         ))
 
 
@@ -154,6 +173,13 @@ def run_proxy(
     The proxy runs until the caller calls master.shutdown(), which the passive
     mode runner does after the browser session ends.
 
+    mitmproxy 12.x requires the event loop to be *running* (not just set) when
+    DumpMaster is instantiated because Master.__init__ calls
+    asyncio.get_running_loop(). This function therefore creates the DumpMaster
+    inside a coroutine that runs on the dedicated background loop, signals a
+    threading.Event when the master is ready, and then awaits master.run().
+    The caller blocks on that event before returning the master reference.
+
     Args:
         store: CaptureStore to pass to SentryAddon for writing captured headers.
         target_host (str): Hostname to filter API responses by.
@@ -162,24 +188,35 @@ def run_proxy(
 
     Returns:
         mitmproxy DumpMaster instance running in a background thread.
+
+    Raises:
+        RuntimeError: If the proxy fails to start within 5 seconds.
     """
     from mitmproxy.tools.dump import DumpMaster
 
     opts = build_proxy_options(host=host, port=port)
-
-    # mitmproxy 12.x calls asyncio.get_event_loop() during DumpMaster.__init__,
-    # which raises RuntimeError when called from a non-async context with no
-    # current loop. Create and register a loop before constructing the master.
     loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
-    master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-    master.addons.add(SentryAddon(store=store, target_host=target_host))
+    _holder: list[Any] = []
+    _ready = threading.Event()
 
-    def _run() -> None:
+    async def _start() -> None:
+        # DumpMaster must be created here — inside the running loop — because
+        # Master.__init__ calls asyncio.get_running_loop().
+        master = DumpMaster(opts, loop=loop, with_termlog=False, with_dumper=False)
+        master.addons.add(SentryAddon(store=store, target_host=target_host))
+        _holder.append(master)
+        _ready.set()
+        await master.run()
+
+    def _thread() -> None:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(master.run())
+        loop.run_until_complete(_start())
 
-    thread = threading.Thread(target=_run, daemon=True)
+    thread = threading.Thread(target=_thread, daemon=True)
     thread.start()
-    return master
+
+    if not _ready.wait(timeout=5):
+        raise RuntimeError("mitmproxy failed to start within 5 seconds")
+
+    return _holder[0]

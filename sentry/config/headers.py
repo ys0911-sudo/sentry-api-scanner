@@ -620,4 +620,31 @@ AUTH_SECURITY_FLAGS: dict[str, AuthSecurityFlag] = {
         severity="HIGH",
         remediation="Reject all non-TLS connections at the load balancer level",
     ),
+
+    # CORS
+    "cors_wildcard_origin": AuthSecurityFlag(
+        description="Access-Control-Allow-Origin: * permits any cross-origin request",
+        severity="MEDIUM",
+        remediation="Restrict to an explicit whitelist of trusted origins",
+    ),
+    "cors_wildcard_with_credentials": AuthSecurityFlag(
+        description="Wildcard CORS origin combined with Allow-Credentials — broken policy",
+        severity="HIGH",
+        remediation="Use an explicit origin whitelist when Allow-Credentials is required",
+    ),
+    "cors_reflected_origin": AuthSecurityFlag(
+        description="Server blindly reflects the request Origin in Access-Control-Allow-Origin",
+        severity="HIGH",
+        remediation="Validate Origin against an explicit whitelist; never reflect blindly",
+    ),
+    "cors_reflected_origin_with_credentials": AuthSecurityFlag(
+        description="Reflected origin with Allow-Credentials: true — any site can make authenticated requests",
+        severity="CRITICAL",
+        remediation="Implement strict origin whitelist and never combine reflected origin with credentials",
+    ),
+    "cors_missing_vary_origin": AuthSecurityFlag(
+        description="CORS response missing Vary: Origin — cached response may leak to wrong origins",
+        severity="MEDIUM",
+        remediation="Add Vary: Origin to every response that sets Access-Control-Allow-Origin",
+    ),
 }
