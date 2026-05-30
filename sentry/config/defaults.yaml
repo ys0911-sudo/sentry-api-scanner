@@ -1,0 +1,10 @@
+output_format: table        # table | json | html | pdf
+output_dir: ./reports
+proxy_host: 127.0.0.1
+proxy_port: 8080
+timeout: 30                 # seconds per request
+follow_redirects: true
+max_spider_depth: 3
+max_spider_urls: 100
+user_agent: "Sentry/0.1.0 API Security Scanner"
+verify_ssl: false           # mitm proxy requires this

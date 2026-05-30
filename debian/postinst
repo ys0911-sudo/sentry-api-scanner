@@ -1,0 +1,43 @@
+#!/bin/sh
+# debian/postinst
+#
+# Post-installation script for the sentry-api-scanner Debian package.
+# Runs after dpkg has placed all files on disk.
+#
+# Steps:
+#   1. Install the Chromium browser for Playwright (passive mode only).
+#   2. Detect the graphical display environment and cache the result to
+#      ~/.sentry/environment.json so that sentry/main.py can read it at
+#      startup to decide whether --passive should be registered.
+#   3. Create the system-wide default reports directory.
+
+set -e
+
+case "$1" in
+    configure)
+        # Install Chromium for Playwright-based passive mode.
+        # 'true' prevents a missing Playwright binary from failing the install
+        # on headless systems where passive mode will be unavailable anyway.
+        if command -v playwright >/dev/null 2>&1; then
+            playwright install chromium || true
+        fi
+
+        # Run environment detection so that ~/.sentry/environment.json exists
+        # before the user first runs 'sentry'. The detect_and_save() function
+        # checks DISPLAY, WAYLAND_DISPLAY, /proc/1/environ and WSL signals then
+        # writes {"passive_available": true/false}.
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c \
+                "from sentry.config.environment import detect_and_save; detect_and_save()" \
+                || true
+        fi
+
+        # Create the system-wide reports root used when Sentry is installed
+        # as a shared tool (e.g. on a pentest appliance). Per-user reports
+        # default to ~/sentry-reports/ handled by core/reporter.py instead.
+        mkdir -p /var/lib/sentry/reports
+        ;;
+esac
+
+#DEBHELPER#
+exit 0

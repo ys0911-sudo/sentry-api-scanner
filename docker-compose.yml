@@ -1,0 +1,12 @@
+services:
+  sentry:
+    build: .
+    image: sentry-api-scanner:latest
+    network_mode: host
+    volumes:
+      - ./reports:/app/reports
+      - ./urls.txt:/app/urls.txt:ro
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+    stdin_open: true
+    tty: true

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentry-api-scanner"
+version = "0.1.0"
+description = "Silent API security header scanner"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Yash Saran", email = "yashsaran0911@gmail.com" }]
+requires-python = ">=3.11"
+keywords = ["security", "api", "scanner", "headers", "pentesting"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "mitmproxy>=10.1",
+    "playwright>=1.40",
+    "click>=8.1",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+pdf = ["reportlab>=4.0", "pillow>=10.0"]
+
+[project.scripts]
+sentry = "sentry.main:cli"
+# Run 'sentry-detect-env' once after 'pip install' on systems where the
+# post-install hook does not run automatically (e.g. manual venv installs).
+# It writes ~/.sentry/environment.json so that the CLI knows whether
+# --passive is available without probing the display on every invocation.
+sentry-detect-env = "sentry.config.environment:detect_and_save"
+
+[project.urls]
+Repository = "https://github.com/ys0911-sudo/sentry"
+"Bug Tracker" = "https://github.com/ys0911-sudo/sentry/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentry*"]
+
+[tool.setuptools.package-data]
+"sentry.config" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]

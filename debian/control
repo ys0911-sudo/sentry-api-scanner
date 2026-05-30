@@ -1,0 +1,23 @@
+Source: sentry-api-scanner
+Section: net
+Priority: optional
+Maintainer: Yash Saran <yashsaran0911@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-all, python3-setuptools
+Standards-Version: 4.6.2
+Homepage: https://github.com/ys0911-sudo/sentry
+Rules-Requires-Root: no
+
+Package: sentry-api-scanner
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+ python3-click,
+ python3-yaml,
+ python3-requests
+Recommends: python3-rich
+Description: Silent API security header scanner
+ Sentry scans REST, GraphQL, SOAP, gRPC and other API endpoints
+ for missing security headers (HSTS, CSP, X-Frame-Options) and
+ harmful disclosure headers (Server, X-Powered-By).
+ .
+ Three scan modes: passive browser interception, active URL list
+ scanning, and spider-based API discovery.
