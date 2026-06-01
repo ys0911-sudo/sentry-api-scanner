@@ -1,0 +1,13 @@
+# Runtime dependencies. Keep in sync with [project].dependencies in pyproject.toml.
+# mitmproxy is pinned to 12.x: core/interceptor.py builds DumpMaster with a
+# loop= kwarg and relies on the 12.x asyncio.get_running_loop() startup behaviour.
+mitmproxy>=12.0
+playwright>=1.40
+click>=8.1
+rich>=13.7
+pyyaml>=6.0
+requests>=2.31
+# reportlab + pillow power --output pdf (reporter.save_pdf_report). Required, not
+# optional: --output pdf must work immediately after a plain install.
+reportlab>=4.0
+pillow>=10.0

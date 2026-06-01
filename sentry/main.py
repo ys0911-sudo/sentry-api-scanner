@@ -1,0 +1,412 @@
+"""
+main.py
+
+Entry point for the Sentry CLI. Builds the Click command object dynamically at
+module import time so that --passive is registered only when a graphical display
+was detected at install time. On headless or server installations --passive is
+absent from the command entirely: it does not appear in --help output and
+produces Click's standard "No such option: --passive" error if typed.
+
+The environment check reads ~/.sentry/environment.json written by
+sentry/config/environment.py during post-install. If that file is absent (e.g.
+during development from source), a live detection is performed instead.
+
+Classes:
+    None
+
+Functions:
+    _build_params: Construct the Click parameter list for the current environment.
+    _version_callback: Eager callback that prints the version string and exits.
+    _run: Primary CLI callback — validates inputs and dispatches to the right mode.
+    _run_active: Dispatch an active-mode scan.
+    _run_passive: Dispatch a passive-mode scan.
+"""
+
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+import click
+from rich.console import Console
+
+from sentry import __version__
+from sentry.config.environment import is_passive_available
+
+console = Console()
+
+# Evaluated once at import time so the entire params list is stable for the
+# lifetime of the process; repeated invocations see the same option set.
+_PASSIVE_AVAILABLE: bool = is_passive_available()
+
+def _build_help_text() -> str:
+    """
+    Build the CLI help text for the current environment.
+
+    Appends a passive mode example only when a graphical display was detected,
+    matching the conditional registration of the --passive flag itself.
+
+    Returns:
+        str: Formatted help text string passed to the Click command.
+    """
+    base = """\
+sentryscan -- API Security Header Scanner.
+
+Scans HTTP APIs for missing or misconfigured security headers and produces a
+structured report. Choose a scan mode, supply a target URL or URL list, and
+optionally control output format and report save location.
+
+Examples:
+
+  sentryscan --active --url https://api.example.com
+
+  sentryscan --active --file urls.txt --output json
+
+  sentryscan --active --url https://api.example.com --save /tmp/my-reports
+"""
+    if _PASSIVE_AVAILABLE:
+        base += "\n  sentryscan --passive --url https://app.example.com --timeout 120\n"
+    return base
+
+
+def _build_params() -> list[click.Parameter]:
+    """
+    Construct the complete Click parameter list for the current environment.
+
+    Reads the module-level _PASSIVE_AVAILABLE flag (set at import time from the
+    install-time environment cache) and conditionally prepends --passive to the
+    mode-flag group. All other parameters are always registered.
+
+    Returns:
+        list[click.Parameter]: Ordered list of Click Parameter objects attached
+                               to the sentry command.
+    """
+    params: list[click.Parameter] = []
+
+    # --- Mode flags -------------------------------------------------------
+    # Passive is only added when a display was detected at install time.
+    # The three flags are independent booleans; mutual exclusion is enforced
+    # in _run() so the help output stays clean without hidden constraints.
+    if _PASSIVE_AVAILABLE:
+        params.append(
+            click.Option(
+                ["--passive"],
+                is_flag=True,
+                default=False,
+                help="Launch browser and capture API traffic passively.",
+            )
+        )
+
+    params.append(
+        click.Option(
+            ["--active"],
+            is_flag=True,
+            default=False,
+            help="Scan known API URLs directly with HTTP requests.",
+        )
+    )
+
+    # --- Target input -----------------------------------------------------
+    params.extend(
+        [
+            click.Option(
+                ["--url", "-u"],
+                metavar="URL",
+                default=None,
+                help="Single target URL to scan.",
+            ),
+            click.Option(
+                ["--file", "-f"],
+                type=click.Path(exists=True, readable=True, path_type=Path),
+                default=None,
+                metavar="FILE",
+                help="File containing one URL per line for batch scanning.",
+            ),
+        ]
+    )
+
+    # --- Output control ---------------------------------------------------
+    params.extend(
+        [
+            click.Option(
+                ["--output", "-o"],
+                type=click.Choice(["table", "json", "html", "pdf"], case_sensitive=False),
+                default="table",
+                show_default=True,
+                help=(
+                    "Output format. table/json control terminal display. "
+                    "html/pdf save an additional report file alongside report.json."
+                ),
+            ),
+            click.Option(
+                ["--save", "-s"],
+                type=click.Path(path_type=Path),
+                default=None,
+                metavar="DIR",
+                help="Override default report save location (~/sentry-reports/).",
+            ),
+        ]
+    )
+
+    # --- Scan behaviour ---------------------------------------------------
+    params.extend(
+        [
+            click.Option(
+                ["--timeout", "-t"],
+                type=int,
+                default=30,
+                show_default=True,
+                metavar="SECONDS",
+                help=(
+                    "Per-request timeout in seconds."
+                    + (
+                        " For --passive, this is the total browser session duration"
+                        " — use a higher value (e.g. 120) to give yourself time to browse."
+                        if _PASSIVE_AVAILABLE else ""
+                    )
+                ),
+            ),
+            click.Option(
+                ["--insecure", "-k"],
+                is_flag=True,
+                default=False,
+                help="Disable SSL certificate verification.",
+            ),
+            click.Option(
+                ["--verbose", "-v"],
+                is_flag=True,
+                default=False,
+                help="Print each request as it is made.",
+            ),
+            click.Option(
+                ["--user-agent"],
+                default=None,
+                metavar="STRING",
+                help=(
+                    "Override the HTTP User-Agent header sent with each request. "
+                    "Default is a neutral string that does not advertise this tool."
+                ),
+            ),
+            click.Option(
+                ["--concurrency", "-c"],
+                type=int,
+                default=5,
+                show_default=True,
+                metavar="N",
+                help="Number of URLs scanned in parallel in --active mode.",
+            ),
+            click.Option(
+                ["--retries"],
+                type=int,
+                default=2,
+                show_default=True,
+                metavar="N",
+                help=(
+                    "Retry attempts for transient failures (connection resets, "
+                    "429, 5xx). Honours Retry-After for polite backoff."
+                ),
+            ),
+            click.Option(
+                ["--probe/--no-probe"],
+                default=True,
+                show_default=True,
+                help=(
+                    "Send read-only POST probes (GraphQL introspection, JSON-RPC "
+                    "rpc.discover) to GraphQL/JSON-RPC paths to confirm API type. "
+                    "Only paths that already look like those protocols are probed; "
+                    "no other endpoint receives a POST."
+                ),
+            ),
+        ]
+    )
+
+    # --- Meta flags -------------------------------------------------------
+    params.append(
+        click.Option(
+            ["--version", "-V"],
+            is_flag=True,
+            is_eager=True,
+            expose_value=False,
+            callback=_version_callback,
+            help="Show version and exit.",
+        )
+    )
+
+    return params
+
+
+def _version_callback(
+    ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> None:
+    """
+    Print the version string and exit when --version or -V is passed.
+
+    Registered as an eager callback so it fires before argument validation,
+    which allows 'sentry --version' without requiring --url or a mode flag.
+
+    Args:
+        ctx (click.Context): The active Click context.
+        _param (click.Parameter): The triggering parameter (not used directly).
+        value (bool): True when --version was supplied on the command line.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(f"Sentry {__version__}")
+    ctx.exit()
+
+
+def _run(
+    active: bool,
+    url: Optional[str],
+    file: Optional[Path],
+    output: str,
+    save: Optional[Path],
+    timeout: int,
+    insecure: bool,
+    verbose: bool,
+    user_agent: Optional[str] = None,
+    concurrency: int = 5,
+    retries: int = 2,
+    probe: bool = True,
+    **kwargs: Any,
+) -> None:
+    """
+    Primary CLI callback invoked by Click after all arguments are parsed.
+
+    Resolves the scan mode from the mode flags, enforces mutual exclusion,
+    validates that exactly one target source is provided, then dispatches to the
+    appropriate mode runner. **kwargs absorbs 'passive' when passive mode is
+    registered in the current environment, avoiding a signature mismatch between
+    headless and desktop installations.
+
+    Args:
+        active (bool): True when --active was passed.
+        url (Optional[str]): Single target URL, or None if --file was used.
+        file (Optional[Path]): Path to URL list file, or None if --url was used.
+        output (str): Terminal output format from Click.Choice.
+        save (Optional[Path]): Override directory for saved reports, or None.
+        timeout (int): Per-request timeout in seconds.
+        insecure (bool): When True, SSL verification is disabled.
+        verbose (bool): When True, each request is echoed to the terminal.
+        user_agent (Optional[str]): Override the request User-Agent header.
+        concurrency (int): URLs scanned in parallel in active mode.
+        retries (int): Retry attempts for transient failures.
+        probe (bool): Send read-only POST probes to GraphQL/JSON-RPC paths.
+        **kwargs: Absorbs 'passive' (bool) when registered in this environment.
+
+    Raises:
+        click.UsageError: When --passive and --active are both given; when no
+                          target is provided; when both --url and --file are
+                          given; when --passive is combined with --file; or when
+                          the --save directory is not writable.
+    """
+    # **kwargs carries 'passive' only when _PASSIVE_AVAILABLE is True
+    passive: bool = kwargs.get("passive", False)
+
+    # --passive and --active are mutually exclusive; default to active otherwise.
+    if passive and active:
+        raise click.UsageError("Specify only one mode flag: --passive or --active.")
+
+    mode = "passive" if passive else "active"
+
+    # Require exactly one target source
+    if url is None and file is None:
+        if mode == "passive":
+            raise click.UsageError(
+                "--passive requires a target URL.\n"
+                "Usage: sentryscan --passive --url https://app.example.com --timeout 120"
+            )
+        raise click.UsageError("Provide a target with --url URL or --file FILE.")
+    if url is not None and file is not None:
+        raise click.UsageError("Use --url or --file, not both.")
+
+    # Passive mode only supports a single URL — file input would crash inside
+    # passive.run() because config["url"] would be None.
+    if mode == "passive" and file is not None:
+        raise click.UsageError(
+            "--passive requires --url; batch file input is not supported in passive mode."
+        )
+
+    # Validate the --save directory before the scan starts so a
+    # permissions error does not silently discard results after a long session.
+    if save is not None:
+        try:
+            check_dir = save if save.exists() else save.parent
+            writable = os.access(check_dir, os.W_OK)
+        except PermissionError:
+            writable = False
+        if not writable:
+            raise click.UsageError(
+                f"Cannot write to save directory: {save}\n"
+                "Check that the path exists and you have write permission."
+            )
+        try:
+            save.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise click.UsageError(f"Cannot create save directory {save}: {exc}") from exc
+
+    scan_config: dict = {
+        "url": url,
+        "file": file,
+        "output": output,
+        "save": save,
+        "timeout": timeout,
+        "verify_ssl": not insecure,
+        "verbose": verbose,
+        "user_agent": user_agent,
+        "concurrency": concurrency,
+        "retries": retries,
+        "probe": probe,
+    }
+
+    if mode == "passive":
+        _run_passive(scan_config)
+    else:
+        _run_active(scan_config)
+
+
+def _run_active(config: dict) -> None:
+    """
+    Dispatch an active-mode scan and print results.
+
+    Imports modes.active lazily so that import-time errors in other unimplemented
+    modules do not break the CLI on those code paths.
+
+    Args:
+        config (dict): Scan configuration dict built by _run.
+    """
+    from sentry.modes.active import run as _active_run
+
+    _active_run(config)
+
+
+def _run_passive(config: dict) -> None:
+    """
+    Dispatch a passive-mode scan via browser interception and print results.
+
+    Imports modes.passive lazily so that Playwright and mitmproxy are only
+    loaded when passive mode is actually invoked. This function is only
+    reachable when _PASSIVE_AVAILABLE is True, so no additional display check
+    is needed here.
+
+    Args:
+        config (dict): Scan configuration dict built by _run.
+    """
+    from sentry.modes.passive import run as _passive_run
+
+    _passive_run(config)
+
+
+# Build the Click command at module import time. _build_params() reads the
+# environment cache so the params list is fixed before any invocation occurs.
+cli = click.Command(
+    name="sentryscan",
+    callback=_run,
+    params=_build_params(),
+    help=_build_help_text(),
+    context_settings={
+        "help_option_names": ["--help", "-h"],
+        "max_content_width": 100,
+    },
+)

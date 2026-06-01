@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest>=7.4
+pytest-httpserver>=1.0
+black>=23.12
+flake8>=7.0
+mypy>=1.8
+types-PyYAML>=6.0
+types-requests>=2.31
