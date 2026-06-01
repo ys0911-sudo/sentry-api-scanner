@@ -18,9 +18,8 @@ Functions:
     _build_params: Construct the Click parameter list for the current environment.
     _version_callback: Eager callback that prints the version string and exits.
     _run: Primary CLI callback — validates inputs and dispatches to the right mode.
-    _run_active: Dispatch an active-mode scan (skeleton — logic added in later phase).
-    _run_passive: Dispatch a passive-mode scan (skeleton — logic added in later phase).
-    _run_spider: Dispatch a spider-mode scan (skeleton — logic added in later phase).
+    _run_active: Dispatch an active-mode scan.
+    _run_passive: Dispatch a passive-mode scan.
 """
 
 import os
@@ -97,21 +96,13 @@ def _build_params() -> list[click.Parameter]:
             )
         )
 
-    params.extend(
-        [
-            click.Option(
-                ["--active"],
-                is_flag=True,
-                default=False,
-                help="Scan known API URLs directly with HTTP requests.",
-            ),
-            click.Option(
-                ["--spider"],
-                is_flag=True,
-                default=False,
-                help="[NOT YET IMPLEMENTED] Auto-discover and scan endpoints from a base URL.",
-            ),
-        ]
+    params.append(
+        click.Option(
+            ["--active"],
+            is_flag=True,
+            default=False,
+            help="Scan known API URLs directly with HTTP requests.",
+        )
     )
 
     # --- Target input -----------------------------------------------------
@@ -175,14 +166,6 @@ def _build_params() -> list[click.Parameter]:
                 ),
             ),
             click.Option(
-                ["--depth", "-d"],
-                type=int,
-                default=3,
-                show_default=True,
-                metavar="DEPTH",
-                help="Maximum crawl depth for --spider mode.",
-            ),
-            click.Option(
                 ["--insecure", "-k"],
                 is_flag=True,
                 default=False,
@@ -201,6 +184,36 @@ def _build_params() -> list[click.Parameter]:
                 help=(
                     "Override the HTTP User-Agent header sent with each request. "
                     "Default is a neutral string that does not advertise this tool."
+                ),
+            ),
+            click.Option(
+                ["--concurrency", "-c"],
+                type=int,
+                default=5,
+                show_default=True,
+                metavar="N",
+                help="Number of URLs scanned in parallel in --active mode.",
+            ),
+            click.Option(
+                ["--retries"],
+                type=int,
+                default=2,
+                show_default=True,
+                metavar="N",
+                help=(
+                    "Retry attempts for transient failures (connection resets, "
+                    "429, 5xx). Honours Retry-After for polite backoff."
+                ),
+            ),
+            click.Option(
+                ["--probe/--no-probe"],
+                default=True,
+                show_default=True,
+                help=(
+                    "Send read-only POST probes (GraphQL introspection, JSON-RPC "
+                    "rpc.discover) to GraphQL/JSON-RPC paths to confirm API type. "
+                    "Only paths that already look like those protocols are probed; "
+                    "no other endpoint receives a POST."
                 ),
             ),
         ]
@@ -245,68 +258,57 @@ def _version_callback(
 
 def _run(
     active: bool,
-    spider: bool,
     url: Optional[str],
     file: Optional[Path],
     output: str,
     save: Optional[Path],
     timeout: int,
-    depth: int,
     insecure: bool,
     verbose: bool,
     user_agent: Optional[str] = None,
+    concurrency: int = 5,
+    retries: int = 2,
+    probe: bool = True,
     **kwargs: Any,
 ) -> None:
     """
     Primary CLI callback invoked by Click after all arguments are parsed.
 
-    Resolves the active scan mode from the three mode flags, enforces mutual
-    exclusion, validates that exactly one target source is provided, then
-    dispatches to the appropriate mode runner. **kwargs absorbs 'passive' when
-    passive mode is registered in the current environment, avoiding a signature
-    mismatch between headless and desktop installations.
+    Resolves the scan mode from the mode flags, enforces mutual exclusion,
+    validates that exactly one target source is provided, then dispatches to the
+    appropriate mode runner. **kwargs absorbs 'passive' when passive mode is
+    registered in the current environment, avoiding a signature mismatch between
+    headless and desktop installations.
 
     Args:
         active (bool): True when --active was passed.
-        spider (bool): True when --spider was passed.
         url (Optional[str]): Single target URL, or None if --file was used.
         file (Optional[Path]): Path to URL list file, or None if --url was used.
         output (str): Terminal output format from Click.Choice.
         save (Optional[Path]): Override directory for saved reports, or None.
         timeout (int): Per-request timeout in seconds.
-        depth (int): Spider crawl depth limit.
         insecure (bool): When True, SSL verification is disabled.
         verbose (bool): When True, each request is echoed to the terminal.
+        user_agent (Optional[str]): Override the request User-Agent header.
+        concurrency (int): URLs scanned in parallel in active mode.
+        retries (int): Retry attempts for transient failures.
+        probe (bool): Send read-only POST probes to GraphQL/JSON-RPC paths.
         **kwargs: Absorbs 'passive' (bool) when registered in this environment.
 
     Raises:
-        click.UsageError: When more than one mode flag is given; when no target
-                          is provided; when both --url and --file are given;
-                          when --passive is combined with --file; or when the
-                          --save directory is not writable.
+        click.UsageError: When --passive and --active are both given; when no
+                          target is provided; when both --url and --file are
+                          given; when --passive is combined with --file; or when
+                          the --save directory is not writable.
     """
     # **kwargs carries 'passive' only when _PASSIVE_AVAILABLE is True
     passive: bool = kwargs.get("passive", False)
 
-    # Exactly one mode flag must be set; default to active when none is given
-    modes_selected = sum([passive, active, spider])
-    if modes_selected > 1:
-        raise click.UsageError(
-            "Specify only one mode flag: "
-            + (
-                "--passive, --active, or --spider."
-                if _PASSIVE_AVAILABLE
-                else "--active or --spider."
-            )
-        )
+    # --passive and --active are mutually exclusive; default to active otherwise.
+    if passive and active:
+        raise click.UsageError("Specify only one mode flag: --passive or --active.")
 
-    if passive:
-        mode = "passive"
-    elif spider:
-        mode = "spider"
-    else:
-        # --active or no flag — active is the default mode
-        mode = "active"
+    mode = "passive" if passive else "active"
 
     # Require exactly one target source
     if url is None and file is None:
@@ -319,22 +321,14 @@ def _run(
     if url is not None and file is not None:
         raise click.UsageError("Use --url or --file, not both.")
 
-    # Bug 1: passive mode only supports a single URL — file input would crash
-    # inside passive.run() because config["url"] would be None.
+    # Passive mode only supports a single URL — file input would crash inside
+    # passive.run() because config["url"] would be None.
     if mode == "passive" and file is not None:
         raise click.UsageError(
             "--passive requires --url; batch file input is not supported in passive mode."
         )
 
-    # Bug 5: --depth only has meaning for --spider; warn so the user is not
-    # misled into thinking it affects active or passive scan behaviour.
-    if depth != 3 and mode != "spider":
-        console.print(
-            "[yellow][[WARN]][/yellow] --depth is only used with --spider "
-            f"and has no effect in {mode} mode."
-        )
-
-    # Bug 6: validate the --save directory before the scan starts so a
+    # Validate the --save directory before the scan starts so a
     # permissions error does not silently discard results after a long session.
     if save is not None:
         try:
@@ -358,16 +352,16 @@ def _run(
         "output": output,
         "save": save,
         "timeout": timeout,
-        "depth": depth,
         "verify_ssl": not insecure,
         "verbose": verbose,
         "user_agent": user_agent,
+        "concurrency": concurrency,
+        "retries": retries,
+        "probe": probe,
     }
 
     if mode == "passive":
         _run_passive(scan_config)
-    elif mode == "spider":
-        _run_spider(scan_config)
     else:
         _run_active(scan_config)
 
@@ -402,21 +396,6 @@ def _run_passive(config: dict) -> None:
     from sentry.modes.passive import run as _passive_run
 
     _passive_run(config)
-
-
-def _run_spider(config: dict) -> None:
-    """
-    Dispatch a spider-mode scan and print results.
-
-    Skeleton implementation — crawl and scan logic is added in the spider-mode
-    phase. Imports modes.spider lazily for the same reason as _run_active.
-
-    Args:
-        config (dict): Scan configuration dict built by _run.
-    """
-    from sentry.modes import spider as _spider_module  # noqa: F401
-
-    console.print("[bold cyan][[INFO]][/bold cyan] Spider scan not yet implemented.")
 
 
 # Build the Click command at module import time. _build_params() reads the

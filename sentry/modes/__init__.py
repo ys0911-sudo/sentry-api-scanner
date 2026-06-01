@@ -9,5 +9,4 @@ in sentry/core/ and is imported by each mode module as needed.
 Modules:
     active: Direct HTTP request scanning — available on all installation types.
     passive: Browser-based traffic capture — available on desktop installations only.
-    spider: Crawl-then-scan workflow — available on all installation types.
 """

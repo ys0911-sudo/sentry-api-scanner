@@ -299,7 +299,7 @@ def detect_api_type(
         request_headers (Optional[dict[str, str]]): Request headers observed
                                                      by the interceptor (passive
                                                      mode only). Pass None in
-                                                     active/spider mode.
+                                                     active mode.
 
     Returns:
         DetectionResult: The detected type, confidence score, and matched signals.

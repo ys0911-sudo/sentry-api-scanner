@@ -390,7 +390,7 @@ class AuthSignature:
 
     All fields are tuples of lowercase strings. core.analyzer checks observed
     request and response attributes against these tuples in all scan modes
-    (active, passive, and spider). Auth detection is not passive-only.
+    (active and passive). Auth detection is not passive-only.
 
     Attributes:
         auth_header_prefixes (tuple[str, ...]): Case-insensitive prefix values
@@ -428,25 +428,28 @@ AUTH_SIGNATURES: dict[str, AuthSignature] = {
         auth_header_prefixes=(),
         request_header_names=(
             "x-api-key",
-            "x-api-key",                    # capitalisation variant normalised to lowercase
             "api-key",
             "x-auth-token",
             "x-rapidapi-key",               # RapidAPI marketplace
             "x-mashape-key",                # Mashape / RapidAPI legacy
             "x-ibm-client-id",              # IBM API Connect
             "apikey",                        # non-hyphenated variant
-            "token",                         # generic token header
+            # A bare "token" request header was removed: it is too generic
+            # (CSRF tokens, pagination cursors, anti-forgery tokens) and produced
+            # false positives. Specific names such as x-auth-token are retained.
         ),
         response_header_names=(),
+        # Unambiguous credential-bearing query-parameter names. Their presence is
+        # flagged regardless of value. Generic names (key/token/auth) are matched
+        # separately via APIKEY_AMBIGUOUS_URL_PARAMS with a value heuristic so that
+        # non-secret values (?key=name, ?token=1, ?auth=true) are not flagged.
+        # "client_id" was removed: an OAuth client_id is a public identifier by
+        # design, not a secret, so flagging it in a URL would be a false positive.
         url_param_names=(
             "api_key",
             "apikey",
-            "key",
-            "token",
-            "access_token",
-            "auth",
             "api_token",
-            "client_id",
+            "access_token",
             "client_secret",                 # never safe in URL — always CRITICAL
         ),
         cookie_name_patterns=(),
@@ -525,6 +528,15 @@ AUTH_SIGNATURES: dict[str, AuthSignature] = {
         ),
     ),
 }
+
+
+# Generic query-parameter names that *may* carry a credential but are frequently
+# used for non-secret values (pagination keys, sort keys, boolean flags). The
+# analyzer flags these only when the value looks like a real secret, which keeps
+# the apikey_in_url finding precise. Kept separate from
+# AUTH_SIGNATURES["apikey"].url_param_names, whose names are credential-bearing by
+# definition and always flag regardless of value.
+APIKEY_AMBIGUOUS_URL_PARAMS: tuple[str, ...] = ("key", "token", "auth")
 
 
 # ---------------------------------------------------------------------------

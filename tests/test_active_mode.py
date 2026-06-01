@@ -45,6 +45,7 @@ from sentry.modes.active import (
     _build_results_dict,
     _render_results,
     load_urls_from_file,
+    normalize_url,
     run,
 )
 
@@ -372,7 +373,7 @@ class TestActiveScannerScan:
                 scanner2 = ActiveScanner(urls=["https://api.example.com"])
                 scanner2.scan()
 
-        assert "Sentry/" in captured["session"].headers.get("User-Agent", "")
+        assert "sentryscan/" in captured["session"].headers.get("User-Agent", "")
 
 
 # ---------------------------------------------------------------------------
@@ -479,20 +480,25 @@ class TestRenderResults:
         parsed = json.loads(buf.getvalue())
         assert parsed["scan_type"] == "active"
 
-    def test_html_falls_back_to_table_with_info_note(self) -> None:
-        """html format prints an [INFO] fallback note then renders table content."""
+    def test_html_format_renders_table_to_terminal(self) -> None:
+        """html format renders table content to the terminal; the file is saved
+        separately by run(), not by _render_results."""
         con, buf = _make_console()
         _render_results(con, [_minimal_result()], {}, "html")
         output = buf.getvalue()
-        assert "HTML" in output
-        # Table content still rendered after the note
-        assert "[FAIL]" in output or "Sentry" in output
+        # Table content is rendered (html/pdf only affect the saved file, not
+        # the terminal output, which always uses the table layout).
+        assert "Strict-Transport-Security" in output
+        assert "[FAIL]" in output
 
-    def test_pdf_falls_back_to_table_with_info_note(self) -> None:
-        """pdf format prints an [INFO] fallback note then renders table content."""
+    def test_pdf_format_renders_table_to_terminal(self) -> None:
+        """pdf format renders table content to the terminal; the file is saved
+        separately by run(), not by _render_results."""
         con, buf = _make_console()
         _render_results(con, [_minimal_result()], {}, "pdf")
-        assert "PDF" in buf.getvalue()
+        output = buf.getvalue()
+        assert "Strict-Transport-Security" in output
+        assert "[FAIL]" in output
 
     def test_empty_results_no_urls_prints_warning(self) -> None:
         """No results and no errors produces the 'No URLs were scanned' warning."""
@@ -685,3 +691,140 @@ class TestRun:
         data = json.loads((subdirs[0] / "report.json").read_text())
         assert data["total_scanned"] == 1
         assert "batch_1urls" in data["target"]
+
+
+# ---------------------------------------------------------------------------
+# normalize_url
+# ---------------------------------------------------------------------------
+
+class TestNormalizeUrl:
+    """Tests for scheme normalization of target URLs."""
+
+    def test_bare_host_gets_https(self) -> None:
+        assert normalize_url("api.example.com/v1") == "https://api.example.com/v1"
+
+    def test_existing_http_scheme_is_preserved(self) -> None:
+        assert normalize_url("http://api.example.com") == "http://api.example.com"
+
+    def test_existing_https_scheme_is_preserved(self) -> None:
+        assert normalize_url("https://api.example.com") == "https://api.example.com"
+
+    def test_host_with_port_is_not_mangled(self) -> None:
+        # The "://" check avoids urlparse misreading "localhost:8080" as a scheme.
+        assert normalize_url("localhost:8080/api") == "https://localhost:8080/api"
+
+    def test_whitespace_is_trimmed(self) -> None:
+        assert normalize_url("  api.example.com  ") == "https://api.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency / ordering
+# ---------------------------------------------------------------------------
+
+class TestConcurrencyOrdering:
+    """Results must come back in input order regardless of completion order."""
+
+    def test_results_preserve_input_order(self) -> None:
+        urls = [f"https://api{i}.example.com" for i in range(8)]
+
+        def fake_get(self_s, url, **kwargs):
+            return _mock_response(headers={"Content-Type": "application/json"})
+
+        with patch.object(requests.Session, "get", fake_get):
+            scanner = ActiveScanner(urls=urls, concurrency=4)
+            results = scanner.scan()
+
+        assert [r.url for r in results] == urls
+
+    def test_one_failure_does_not_abort_others(self) -> None:
+        urls = ["https://good1.example.com", "https://bad.example.com",
+                "https://good2.example.com"]
+
+        def fake_get(self_s, url, **kwargs):
+            if "bad" in url:
+                raise requests.exceptions.ConnectionError()
+            return _mock_response()
+
+        with patch.object(requests.Session, "get", fake_get):
+            scanner = ActiveScanner(urls=urls, concurrency=3)
+            results = scanner.scan()
+
+        assert [r.url for r in results] == ["https://good1.example.com",
+                                            "https://good2.example.com"]
+        assert "https://bad.example.com" in scanner.errors
+
+
+# ---------------------------------------------------------------------------
+# Retry configuration
+# ---------------------------------------------------------------------------
+
+class TestRetryConfig:
+    """The session must mount a retry adapter that excludes POST."""
+
+    def test_make_session_mounts_retry_adapter(self) -> None:
+        scanner = ActiveScanner(urls=[], retries=3)
+        session = scanner._make_session()
+        adapter = session.get_adapter("https://x")
+        retry = adapter.max_retries
+        assert retry.total == 3
+        # POST must never be retried (probes are non-idempotent).
+        assert "POST" not in retry.allowed_methods
+        assert "GET" in retry.allowed_methods
+
+
+# ---------------------------------------------------------------------------
+# POST probe (GraphQL / JSON-RPC)
+# ---------------------------------------------------------------------------
+
+class TestPostProbe:
+    """Read-only POST probes confirm GraphQL/JSON-RPC type on matching paths."""
+
+    @pytest.mark.allow_aux_network
+    def test_graphql_path_confirmed_via_probe(self) -> None:
+        get_resp = _mock_response(headers={"Content-Type": "text/html"}, text="", status_code=405)
+        post_resp = _mock_response(
+            headers={"Content-Type": "application/json"},
+            text='{"data":{"__schema":{"queryType":{"name":"Query"}}}}',
+        )
+        with patch.object(requests.Session, "get", return_value=get_resp), \
+             patch.object(requests.Session, "options", side_effect=requests.exceptions.ConnectionError()), \
+             patch.object(requests.Session, "post", return_value=post_resp):
+            scanner = ActiveScanner(urls=["https://api.example.com/graphql"])
+            results = scanner.scan()
+        assert results[0].api_type == "graphql"
+
+    @pytest.mark.allow_aux_network
+    def test_jsonrpc_path_confirmed_via_probe(self) -> None:
+        get_resp = _mock_response(headers={"Content-Type": "text/html"}, text="", status_code=405)
+        post_resp = _mock_response(
+            headers={"Content-Type": "application/json"},
+            text='{"jsonrpc":"2.0","result":{},"id":1}',
+        )
+        with patch.object(requests.Session, "get", return_value=get_resp), \
+             patch.object(requests.Session, "options", side_effect=requests.exceptions.ConnectionError()), \
+             patch.object(requests.Session, "post", return_value=post_resp):
+            scanner = ActiveScanner(urls=["https://api.example.com/rpc/v1"])
+            results = scanner.scan()
+        assert results[0].api_type == "jsonrpc"
+
+    @pytest.mark.allow_aux_network
+    def test_probe_disabled_sends_no_post(self) -> None:
+        get_resp = _mock_response(headers={"Content-Type": "application/json"})
+        post_mock = MagicMock(side_effect=AssertionError("POST must not be sent when probe=False"))
+        with patch.object(requests.Session, "get", return_value=get_resp), \
+             patch.object(requests.Session, "options", side_effect=requests.exceptions.ConnectionError()), \
+             patch.object(requests.Session, "post", post_mock):
+            scanner = ActiveScanner(urls=["https://api.example.com/graphql"], probe=False)
+            scanner.scan()
+        post_mock.assert_not_called()
+
+    @pytest.mark.allow_aux_network
+    def test_no_post_for_non_matching_path(self) -> None:
+        get_resp = _mock_response(headers={"Content-Type": "application/json"})
+        post_mock = MagicMock(side_effect=AssertionError("POST must not hit a plain REST path"))
+        with patch.object(requests.Session, "get", return_value=get_resp), \
+             patch.object(requests.Session, "options", side_effect=requests.exceptions.ConnectionError()), \
+             patch.object(requests.Session, "post", post_mock):
+            scanner = ActiveScanner(urls=["https://api.example.com/v1/users"])
+            scanner.scan()
+        post_mock.assert_not_called()

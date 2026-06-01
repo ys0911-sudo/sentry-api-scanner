@@ -246,12 +246,13 @@ class TestRunProxy:
         return mock_master
 
     def test_returns_dump_master(self):
+        # run_proxy builds the DumpMaster inside a coroutine on a real background
+        # event loop and signals readiness via a threading.Event. We let that real
+        # loop run and only mock DumpMaster (whose run() is an async no-op), so the
+        # coroutine completes immediately and the ready event fires.
         mock_master = self._make_mock_master()
-        mock_loop = MagicMock()
 
-        with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master), \
-             patch("sentry.core.interceptor.asyncio.new_event_loop", return_value=mock_loop), \
-             patch("sentry.core.interceptor.asyncio.set_event_loop"):
+        with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master):
             store = CaptureStore()
             result = run_proxy(store=store, target_host="api.example.com", port=18080)
 
@@ -259,25 +260,25 @@ class TestRunProxy:
 
     def test_dump_master_created_with_correct_options(self):
         mock_master = self._make_mock_master()
-        mock_loop = MagicMock()
 
         with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master) as MockDM, \
-             patch("sentry.core.interceptor.asyncio.new_event_loop", return_value=mock_loop), \
-             patch("sentry.core.interceptor.asyncio.set_event_loop"), \
              patch("sentry.core.interceptor.build_proxy_options") as mock_opts:
             store = CaptureStore()
             run_proxy(store=store, target_host="api.example.com", host="127.0.0.1", port=18081)
 
         mock_opts.assert_called_once_with(host="127.0.0.1", port=18081)
-        MockDM.assert_called_once_with(mock_opts.return_value, with_termlog=False, with_dumper=False)
+        MockDM.assert_called_once()
+        args, kwargs = MockDM.call_args
+        assert args[0] is mock_opts.return_value
+        assert kwargs["with_termlog"] is False
+        assert kwargs["with_dumper"] is False
+        # DumpMaster is bound to the dedicated background loop created in run_proxy.
+        assert "loop" in kwargs
 
     def test_sentry_addon_is_added(self):
         mock_master = self._make_mock_master()
-        mock_loop = MagicMock()
 
-        with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master), \
-             patch("sentry.core.interceptor.asyncio.new_event_loop", return_value=mock_loop), \
-             patch("sentry.core.interceptor.asyncio.set_event_loop"):
+        with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master):
             store = CaptureStore()
             run_proxy(store=store, target_host="api.example.com", port=18082)
 
@@ -287,17 +288,20 @@ class TestRunProxy:
         assert added.store is store
 
     def test_proxy_runs_in_daemon_thread(self):
-        mock_loop = MagicMock()
         mock_master = self._make_mock_master()
 
+        # Wrap the real Thread so the startup coroutine still runs (and the ready
+        # event fires, avoiding the 5s timeout) while we capture its kwargs.
+        real_thread_cls = threading.Thread
+        captured: dict = {}
+
+        def _capture_thread(*args, **kwargs):
+            captured.update(kwargs)
+            return real_thread_cls(*args, **kwargs)
+
         with patch("mitmproxy.tools.dump.DumpMaster", return_value=mock_master), \
-             patch("sentry.core.interceptor.asyncio.new_event_loop", return_value=mock_loop), \
-             patch("sentry.core.interceptor.asyncio.set_event_loop"), \
-             patch("sentry.core.interceptor.threading.Thread") as MockThread:
+             patch("sentry.core.interceptor.threading.Thread", side_effect=_capture_thread):
             store = CaptureStore()
             run_proxy(store=store, target_host="api.example.com", port=18083)
 
-        MockThread.assert_called_once()
-        _, kwargs = MockThread.call_args
-        assert kwargs.get("daemon") is True
-        MockThread.return_value.start.assert_called_once()
+        assert captured.get("daemon") is True

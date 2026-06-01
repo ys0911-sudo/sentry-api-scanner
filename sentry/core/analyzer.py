@@ -3,8 +3,8 @@ analyzer.py
 
 Evaluates HTTP response headers against the security rules in
 sentry/config/headers.py and produces a fully scored EndpointResult for every
-scanned URL. The analyzer is mode-agnostic: active, passive, and spider all
-call analyze_headers() with whatever headers they captured.
+scanned URL. The analyzer is mode-agnostic: active and passive both call
+analyze_headers() with whatever headers they captured.
 
 Two evaluation passes run for each endpoint:
 
@@ -34,6 +34,7 @@ Functions:
     _evaluate_header_quality: Check a present header's value and return PASS/WARN.
     _decode_jwt_claims: Decode a JWT without verifying signature; return header+payload.
     _check_cookies: Parse Set-Cookie headers and return session cookie AuthFindings.
+    _looks_like_secret: Heuristic test for whether a URL param value is a credential.
     _detect_auth: Run the full authentication detection pass and return AuthFindings.
 """
 
@@ -47,6 +48,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from sentry.config.headers import (
+    APIKEY_AMBIGUOUS_URL_PARAMS,
     AUTH_SECURITY_FLAGS,
     AUTH_SIGNATURES,
     HARMFUL_HEADERS,
@@ -227,7 +229,7 @@ def analyze_headers(
         request_headers (Optional[dict[str, str]]): Request headers captured by
                                                      the interceptor (passive) or
                                                      sent by the scanner (active).
-                                                     Pass None in active/spider mode
+                                                     Pass None in active mode
                                                      when original request headers
                                                      are unavailable.
         body_sample (Optional[str]): First ~2 KB of response body, used by the
@@ -548,9 +550,14 @@ def _check_cookies(resp_lower: dict[str, str]) -> list[AuthFinding]:
     findings: list[AuthFinding] = []
     session_patterns = AUTH_SIGNATURES["session"].cookie_name_patterns
 
-    # Split on ", " between separate cookies (RFC 6265 cookies use "; " internally)
-    # This heuristic handles the majority of real-world responses
-    for cookie_str in raw.split(","):
+    # Multiple Set-Cookie headers are commonly folded into a single
+    # comma-joined value (the requests library does this). A naive split on
+    # "," would also break inside the Expires=<HTTP-date> attribute, whose
+    # value contains a comma ("Expires=Wed, 21 Oct 2025 07:28:00 GMT") — that
+    # fragmentation previously produced phantom missing-flag findings on
+    # perfectly secure cookies. Split only on commas that introduce a new
+    # "cookie-name=" pair; commas inside an attribute value are left intact.
+    for cookie_str in re.split(r",\s*(?=[^=;,]+=)", raw):
         cookie_str = cookie_str.strip()
         if not cookie_str:
             continue
@@ -662,10 +669,12 @@ def _analyze_cors(
                     token_info={},
                 ))
 
-    # Vary: Origin must be present whenever CORS headers are set, otherwise a
-    # cache may serve a permissive CORS response to a non-CORS request or to a
-    # request from a different origin.
-    if "origin" not in vary:
+    # Vary: Origin must be present whenever the allowed origin is dynamic
+    # (a specific or reflected origin), otherwise a cache may serve that
+    # origin-specific response to a request from a different origin. It is
+    # irrelevant for a static "Access-Control-Allow-Origin: *", which is
+    # identical for every origin — flagging it there is a false positive.
+    if acao != "*" and "origin" not in vary:
         findings.append(AuthFinding(
             auth_type="cors",
             flags=["cors_missing_vary_origin"],
@@ -677,6 +686,44 @@ def _analyze_cors(
         ))
 
     return findings
+
+
+# ---------------------------------------------------------------------------
+# URL parameter secret heuristic
+# ---------------------------------------------------------------------------
+
+def _looks_like_secret(value: str) -> bool:
+    """
+    Heuristically decide whether a URL parameter value looks like a credential.
+
+    Used to gate the generic query-parameter names in APIKEY_AMBIGUOUS_URL_PARAMS
+    (key / token / auth) so that obviously non-secret values such as ?key=name,
+    ?token=1, or ?auth=true do not raise a false apikey_in_url finding. A value is
+    treated as a secret when it is at least eight characters of token-charset text
+    and either mixes letters and digits (the classic API-key shape) or is a long
+    opaque string (e.g. a hex digest or base64 token).
+
+    Args:
+        value (str): Raw query-parameter value as it appeared in the URL.
+
+    Returns:
+        bool: True if the value resembles a credential, False otherwise.
+    """
+    v = value.strip()
+    if len(v) < 8:
+        return False
+    if v.lower() in {"true", "false", "null", "none", "undefined"}:
+        return False
+    # Reject anything containing characters a token would not use (spaces, etc.)
+    if not re.fullmatch(r"[A-Za-z0-9._\-+/=]+", v):
+        return False
+    has_digit = any(c.isdigit() for c in v)
+    has_alpha = any(c.isalpha() for c in v)
+    # Classic API-key / token shape mixes letter and digit classes; failing that,
+    # a long opaque string is still credential-like (hex digest, base64 blob).
+    if has_digit and has_alpha:
+        return True
+    return len(v) >= 24
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +757,11 @@ def _detect_auth(
     is_http = url.startswith("http://")
 
     parsed = urlparse(url)
-    url_params: set[str] = {k.lower() for k in parse_qs(parsed.query)}
+    # Map lowercase query-parameter name -> list of values. Values are needed for
+    # the secret heuristic applied to generic parameter names.
+    url_params: dict[str, list[str]] = {
+        k.lower(): v for k, v in parse_qs(parsed.query).items()
+    }
 
     auth_header = req_lower.get("authorization", "")
 
@@ -821,18 +872,30 @@ def _detect_auth(
             break
 
     # --- API key in URL parameters ----------------------------------------
+    # Unambiguous credential parameter names always flag. Generic names
+    # (key/token/auth) flag only when the value looks like a real secret, so
+    # ?key=name, ?token=1, and ?auth=true are not reported as leaked keys.
+    matched_param: Optional[str] = None
     for param_name in api_key_sig.url_param_names:
         if param_name in url_params:
-            flags = ["apikey_in_url"]
-            if is_http:
-                flags.append("apikey_over_http")
-            findings.append(AuthFinding(
-                auth_type="apikey",
-                flags=flags,
-                details=f"API key transmitted as URL query parameter '{param_name}'.",
-                token_info={},
-            ))
-            break  # flag once per endpoint even if multiple key params exist
+            matched_param = param_name
+            break
+    if matched_param is None:
+        for param_name in APIKEY_AMBIGUOUS_URL_PARAMS:
+            values = url_params.get(param_name)
+            if values and any(_looks_like_secret(v) for v in values):
+                matched_param = param_name
+                break
+    if matched_param:
+        flags = ["apikey_in_url"]
+        if is_http:
+            flags.append("apikey_over_http")
+        findings.append(AuthFinding(
+            auth_type="apikey",
+            flags=flags,
+            details=f"API key transmitted as URL query parameter '{matched_param}'.",
+            token_info={},
+        ))
 
     # --- Session cookies from Set-Cookie response headers -----------------
     findings.extend(_check_cookies(resp_lower))

@@ -24,7 +24,9 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "mitmproxy>=10.1",
+    # 12.x required: core/interceptor.py passes loop= to DumpMaster and depends
+    # on the 12.x get_running_loop() startup behaviour.
+    "mitmproxy>=12.0",
     "playwright>=1.40",
     "click>=8.1",
     "rich>=13.7",
@@ -58,7 +60,6 @@ include = ["sentry*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 
 [tool.black]
 line-length = 100

@@ -189,7 +189,7 @@ def save_report(
     Convenience wrapper that creates a ReportWriter and saves in one call.
 
     Intended for mode runners that do not need to hold a persistent writer
-    reference during the scan (i.e. single-shot active and spider modes).
+    reference during the scan (i.e. the single-shot active mode).
 
     Args:
         target (str): URL, batch label, or 'passive_session'.
@@ -364,8 +364,11 @@ def render_html(results_dict: dict) -> str:
     # Errors section
     errors_html = ""
     if errors:
+        # Escape both URL and message: the target URL is user-supplied and the
+        # error string can echo server-controlled content, so unescaped values
+        # would allow markup/script injection into the offline HTML report.
         rows = "".join(
-            f"<tr><td>{url}</td><td style='color:#e74c3c'>{msg}</td></tr>"
+            f"<tr><td>{_e(url)}</td><td style='color:#e74c3c'>{_e(msg)}</td></tr>"
             for url, msg in errors.items()
         )
         errors_html = (
@@ -641,9 +644,12 @@ def save_pdf_report(results_dict: dict, report_dir: Path) -> Path:
             Paragraph("<b>Error</b>", style_sub),
         ]]
         for url, msg in errors.items():
+            # Escape before handing to ReportLab's mini-XML parser, consistent
+            # with every other cell in the PDF — an unescaped '<' in a URL or
+            # error string would corrupt the document or inject markup.
             err_rows.append([
-                Paragraph(url, style_normal),
-                Paragraph(f'<font color="{_C_FAIL.hexval()}">{msg}</font>', style_normal),
+                Paragraph(_pe(url), style_normal),
+                Paragraph(f'<font color="{_C_FAIL.hexval()}">{_pe(msg)}</font>', style_normal),
             ])
         t = Table(err_rows, colWidths=[80*mm, 90*mm])
         t.setStyle(TableStyle([
